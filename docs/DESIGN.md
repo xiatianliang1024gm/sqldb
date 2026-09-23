@@ -229,6 +229,14 @@ FuncExpr(name, args | star)        -- 仅聚合函数：COUNT/SUM/AVG/MIN/MAX
 - **三值逻辑在语义层不做进 parser**：parser 只产 AST，NULL 传染规则在 exec 的
   表达式求值器里实现（parser 侧无法知道值）。
 
+- **实现时明确的三条约定**（M1 落地时定的，写在这里以免以后被当成疏忽）：
+  1. 表达式节点多一个 `StarExpr(table?)`，表示 `SELECT *` / `t.*`；
+     `COUNT(*)` 走 `FuncExpr` 的 star，两者不是一回事。
+  2. 类型名（`INT`/`TEXT`/...）**不**进保留字表 —— 它们只在列定义那个位置有意义，
+     否则 `CREATE TABLE t (text TEXT)` 会被误判成语法错误。
+  3. `LIMIT` / `OFFSET` 顺序不限（SQL 标准与各家实现不一致），各自最多出现一次；
+     `SELECT` 必须带 `FROM`（本版本没有"无表查询"的执行路径）。
+
 ---
 
 ## 7. 执行器：Volcano 拉取模型
@@ -378,6 +386,20 @@ M4 依赖 M2；M5 收尾。
   - 单测全绿（`go test ./...`）：保序三铁律（同类型保序 / 往返 / TEXT 前缀无歧义）、
     ±0.0 同编码、行编码往返 + 截断识别、建表重开可读、表 ID 重开后续接、
     DROP 2500 行分批清理。
-- M1 解析器：未开始。
+- **M1 完成（2026-09-23）**：解析器（`internal/parser`，不依赖 M0 之外的任何包）。
+  - `token.go`：关键字表（大小写不敏感、保留原文）、标识符（unicode 判断，中文列名可用）、
+    数字（int/float/科学计数法，词法层就定好 `types.Kind`）、字符串（单引号 + `''` 转义）、
+    运算符（含 `<= >= <> !=`）；位置按 rune 计列，中文不会让列号翻倍；
+  - `ast.go`：语句（CREATE/DROP/INSERT/UPDATE/DELETE/SELECT）+ 表达式
+    （Literal/ColumnRef/Star/Unary/Binary/IsNull/In/Between/Like/Func）。纯语法结构：
+    没有列偏移、没有类型推导，主键列隐式 NOT NULL 留给 catalog；
+  - `parser.go`：`Parse(sql)` 单语句入口（允许一个尾分号，多余 token 报错），
+    表达式用优先级爬升（§6）。两处值得记的语义：`NOT` 低于比较，所以
+    `NOT a = b` 是 `NOT (a = b)`；`IS/IN/BETWEEN/LIKE` 放在爬升循环里而不是跟在
+    primary 后面，所以 `a + b IS NULL` 是 `(a + b) IS NULL`；
+  - 单测（parser 包 85 个用例，全绿）：范围内全部语句、`*`/`t.*`/别名（带不带 AS）、
+    JOIN、GROUP BY/HAVING、ORDER BY（ASC/DESC）、LIMIT/OFFSET（两种顺序）、
+    优先级与结合性 30 例、错误 19 例（含跨行列号与 `*ParseError` 结构化断言）。
+- M2 查询主链：未开始。
 
 任何与本文档冲突的代码，以文档为准——先改文档再改代码。
