@@ -13,3 +13,4 @@ exitcode.txt
 
 # Go 测试产生的数据库目录（catalog 单测等如果改用固定路径时会用到）
 testdata/
+mydata/
