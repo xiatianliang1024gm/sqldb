@@ -307,6 +307,33 @@ func (c *Catalog) CreateTable(name string, cols []Column) (*Table, error) {
 	return t, nil
 }
 
+// NextRowIDs 为一次 INSERT 预留 n 个连续 rowid：返回起始 ID，以及需要编进
+// 同一个 WriteBatch 的计数器更新（key → value，调用方 batch.Put 即可）。
+//
+// 计数器更新跟着行数据同批落盘（DESIGN §8 第 6 步）：崩溃时计数器要么和
+// 行一起推进，要么一起没动，不会出现"行写入了、计数器回退、下次 INSERT
+// 分配出重复 rowid"。非 rowid 表或 n<=0 直接返回零值，调用方无需特判。
+//
+// 读取计数器与提交之间没有隔离 —— 与 INSERT 的主键查重是同一种"无事务"
+// 代价（DESIGN §8），单写者假设下不会发生，如实记录不改。
+func (c *Catalog) NextRowIDs(t *Table, n int) (first uint64, key, value []byte, err error) {
+	if n <= 0 || !t.HasRowid {
+		return 0, nil, nil, nil
+	}
+	k := rowSeqKey(t.ID)
+	v, err := c.kv.Get(k)
+	if err != nil {
+		return 0, nil, nil, fmt.Errorf("catalog: read rowseq for %s: %w", t.Name, err)
+	}
+	if len(v) != 8 {
+		return 0, nil, nil, fmt.Errorf("catalog: corrupt rowseq counter for %s (%d bytes)", t.Name, len(v))
+	}
+	first = binary.BigEndian.Uint64(v)
+	out := make([]byte, 8)
+	binary.BigEndian.PutUint64(out, first+uint64(n))
+	return first, k, out, nil
+}
+
 // DropTable 删表：先按前缀扫出这张表的全部行键，分批 Delete（每批不超过
 // batchDeleteLimit 行），最后一批单独删 schema 键和 rowseq 计数器。
 //

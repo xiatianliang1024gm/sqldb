@@ -1,6 +1,6 @@
 # sqldb 设计方案 —— 在 LSM-Tree KV 引擎上实现 SQL 核心功能
 
-> 状态：设计评审稿（2026-09-23）。代码尚未开始写（types / encoding 有草稿，与本文一致）。
+> 状态：已完成（2026-09-23）。M0~M5 全部落地，代码与本文一致。
 > 目的：学习"SQL 层怎么长在 KV 存储上"。不是造可用数据库，也不做分布式/事务。
 
 ---
@@ -284,6 +284,42 @@ NLJoin    INNER JOIN 嵌套循环：外表逐行 × 内表全扫（内表缓存�
 
 **HAVING**：在 HashAgg 之上套 Filter，求值环境是"组内聚合值 + 分组键"。
 
+### 7.5 M4 落地时定下的约定（代码即此语义，避免以后被当成疏忽）
+
+1. **ORDER BY 的求值环境**：键在 Sort 所在层的行上求值 —— 非聚合查询在
+   基表（连接）行上、聚合查询在 HashAgg 的伪行上，Sort 永远位于 Project
+   之下。别名 / 输出列名 / 序号（`ORDER BY 2`）在计划期先翻译成对应的
+   SELECT 表达式再绑定；翻译不到的按自由表达式处理。
+2. **NULL 排序**：NULL 视为最小值 —— ASC 排最前、DESC 排最后
+   （与 PostgreSQL 的默认 NULLS FIRST / NULLS LAST 一致）。排序用稳定排序，
+   等键行保持扫描序。
+3. **DISTINCT 约束排序键**：SELECT DISTINCT 下 ORDER BY 必须能对应到输出列
+   （别名 / 序号 / 与某个输出项描述一致的表达式），否则报错 —— 去重之后
+   基表行已消失，非输出列的键无处求值，这与 SQL 标准的要求一致。
+   DistinctNode 保留首次出现顺序，去重不会打乱排序结果。
+4. **DISTINCT / 分组的值身份**：按 Kind + 值规范化 —— NULL 与 NULL 同身份
+   （分组、去重语义）；±0.0 归一化成同一身份（与 Compare 判等一致）；
+   INT 5 与 FLOAT 5.0 是不同身份（不同 Kind 不进同一等价类，与 Compare
+   拒绝跨族比较的立场一致）。
+5. **聚合语义**：COUNT(*) 数行、不碰列；其余聚合跳过 NULL。空组（空输入
+   或全 NULL）：COUNT = 0，SUM/AVG/MIN/MAX = NULL。SUM 的 INT 输入保持 INT、
+   见过 FLOAT 才升格；AVG 永远 FLOAT。SUM/AVG 遇到非数值输入在第一个
+   非 NULL 值上报错（§7.4"从宽"的方向）。只有 COUNT(*) 允许 star。
+6. **非聚合列必须被 GROUP BY 覆盖**：SELECT/HAVING/ORDER BY 里聚合之外的
+   列引用，必须被某个 GROUP BY 表达式引用到（列偏移级判定）—— 这是
+   "该列在组内是常量"的充要条件。不做主键函数依赖推导（`GROUP BY id`
+   时选 name 依然报错）。GROUP BY 表达式里不允许聚合。
+7. **聚合查询的伪行**：HashAgg 每组输出"组内第一行的全部基表列 ++
+   各聚合最终值"，输出 / HAVING / ORDER BY 都绑定在伪行上求值；同一个
+   聚合写多处（SELECT 和 ORDER BY 各一遍 COUNT(*)）按表达式去重，只算一份。
+8. **JOIN**：左深嵌套循环，内表整表物化缓存。ON 在连接循环里逐行求值
+   （NULL 不匹配、非 Bool 报错），**不参与下推** —— WHERE 的主键下推
+   按谓词所属的表各自动作。ON 的绑定作用域只含已出现的表（引用后面
+   才 JOIN 的表是错的）。列作用域 = 各表（别名优先）按 FROM 顺序拼接，
+   未限定列命中多张表报 ambiguous。
+9. **LIMIT/OFFSET**：非负整数（解析器保证），OFFSET 先跳过。带 GROUP BY
+   的空输入是零行；无 GROUP BY 的空输入是单组一行（见 §7.2）。
+
 ---
 
 ## 8. 写路径
@@ -300,6 +336,19 @@ NLJoin    INNER JOIN 嵌套循环：外表逐行 × 内表全扫（内表缓存�
 **读检查非原子**：步骤 4 的查重和步骤 5 的提交之间没有隔离（无事务）。
 并发下理论上可产生重复主键。单机嵌入式、单写者假设下可接受，文档如实记录
 ——这是"没有事务"的具体代价之一，不是疏忽。
+
+**M3 落地时定下的四条约定**（代码即此语义，避免以后被当成疏忽）：
+
+1. **类型检查方向**：INT 字面量进 FLOAT 列允许（升格，无损）；FLOAT 进 INT
+   拒绝（隐式截断是坑）；其余跨族一律拒绝。这是取舍表 #11"执行期从宽"的
+   具体方向 —— 从宽指的是"计划期不做推导"，不是"什么都收"。
+2. **NOT NULL 检查对整行生效**：省略的列默认 NULL，同样过不了检查 ——
+   "没写这一列"和"显式写 NULL"在约束眼里是一回事。
+3. **隐藏 rowid 不可显式插入**：列清单里出现 `rowid` 直接报错。它是系统
+   分配的，用户给值会和计数器打架；查询里引用 rowid 合法（它就是主键）。
+4. **失败不落行**：约束检查、主键查重全部发生在 `Write` 之前，任何一行
+   失败整条语句返回错误、一行不落。多行编一个 batch（行数超过 kvdb 的
+   MaxBatchBytes 会报错，不隐式拆批 —— 拆批就丢了语句级原子性）。
 
 ### UPDATE
 
@@ -400,6 +449,99 @@ M4 依赖 M2；M5 收尾。
   - 单测（parser 包 85 个用例，全绿）：范围内全部语句、`*`/`t.*`/别名（带不带 AS）、
     JOIN、GROUP BY/HAVING、ORDER BY（ASC/DESC）、LIMIT/OFFSET（两种顺序）、
     优先级与结合性 30 例、错误 19 例（含跨行列号与 `*ParseError` 结构化断言）。
-- M2 查询主链：未开始。
+- **M2 完成（2026-09-23）**：查询主链（`internal/exec` + 顶层 `sqldb` 包）。
+  - `internal/types/logic.go`：三值逻辑原语（LogicAnd/Or/Not）——§4.4 承诺的
+    "NULL 传染集中在 types 包"落地；false 是比 NULL 更强的传染源，与 PostgreSQL 一致；
+  - `internal/exec/expr.go`：表达式绑定 + 求值。绑定把 AST 翻译成"列名 → 列偏移"的
+    内部树，一次翻译逐行求值；LIKE 的正则在绑定期编译一次缓存于计划内（§6）。
+    求值器一次性做全（比较/四则/AND/OR/NOT/IS NULL/IN/BETWEEN/LIKE），没有只做
+    半个——Filter 需要完整语义，拆开只会造成"半个求值器"的中间态；
+  - `internal/exec/operator.go`：Volcano 节点 Scan/Filter/Project。Scan 带着
+    可观测的"扫描行数"计数器（§7.3 的验收要求）；Filter 是三值逻辑的收口点
+    （NULL 不通过，非 Bool 报错）；
+  - `internal/exec/select.go`：计划构建 + 主键范围下推。合取项拆平后，形如
+    `pk <op> 字面量`（op ∈ {=,<,<=,>,>=}，两种书写顺序都认）折算成
+    [LowerBound, UpperBound)；矛盾条件自然折出空区间。两条保守限制：
+    **字面量类型必须与主键列类型完全一致**（INT 列 vs FLOAT 字面量这类数值混比
+    留在 Filter 里由求值器升格——两套标签字节混进区间会错序），**!= 不下推**；
+  - `sqldb.go`：顶层 Open/Exec/Result（§9），Exec 通吃 DDL/SELECT，
+    INSERT/UPDATE/DELETE 给出明确的"M3 实现"提示而不是含糊报错。
+  - 单测全绿（`go test ./...`），M2 验收线钉死：
+    - 下推可观测：100 行的表 `WHERE id > 90` 扫 9 行，对照组非主键谓词扫 100 行；
+    - 全部六种比较 + 双向书写顺序 + 矛盾条件 + 负数/TEXT/FLOAT 主键的区间正确性；
+    - 三值逻辑（NULL 传染、NOT NULL）、IN/BETWEEN/LIKE（含 QuoteMeta）、
+      表达式投影与别名、Filter 引用未投影列；
+    - 端到端：建表 → 直写行 → 查询 → 关库重开不丢 → DROP 后查询报错。
+  - M2 期间修掉的一个真 bug，值得记：**无上界的下推扫描会漏进 meta 区**。
+    数据区前缀 `d\x00` 按字节序排在 meta 区 `m\x00` 之前，`WHERE id > 90`
+    只有下界，读完本表的行迭代器继续前进就把 schema 的 JSON 当行解码了。
+    修复：扫描上界为空时用表前缀的后继封口（与 kvdb 给 Prefix 算上界同款算法）。
+    教训：共享键空间里做区间扫描，"区间必须完全落在自己的区域内"是调用方的责任，
+    kvdb 不会替你挡。
+- **M3 完成（2026-09-23）**：写路径（`internal/exec/write.go` + catalog 计数器接口）。
+  - `catalog.NextRowIDs`：rowid 计数器的预留接口 —— 返回起始 ID 和需要编进
+    同一个 WriteBatch 的计数器更新，键布局不出 catalog（§5 的"catalog 唯一
+    知道 meta 区"维持不变）；计数器与行数据同批落盘，崩溃时要么一起推进
+    要么一起没动，不会分配出重复 rowid；
+  - `select.go` 的 WHERE 处理抽成 `pushdownWhere` 共享：SELECT 的计划构建和
+    UPDATE/DELETE 的写扫描走同一条下推路径（§8 的要求）—— 否则"改哪几行"
+    和"看见哪几行"会对不上；
+  - `write.go` 三条路径一个骨架：定位（INSERT 点查 / UPDATE·DELETE 扫描）→
+    约束检查 → 一个 WriteBatch 提交。写扫描独立成 `scanTableRows` 而不是给
+    Volcano 接口凿"把键也给我"的口子 —— 写路径本来就要整批物化，并保留
+    可观测的扫描行数（下推效果与 M2 同样可验证）；
+  - UPDATE 禁改主键（取舍表 #10 落地）；SET 求值环境是更新前的行（
+    `SET score = score + 1` 语义）；
+  - 单测全绿（`go test ./...`），M3 验收线钉死：主键冲突（含多行语句中途
+    冲突一行不落）、NOT NULL（显式 NULL 与省略列同样拦截）、类型检查方向、
+    受影响行数、rowid 连续分配 + 显式插入拒绝、写路径下推可观测
+    （`id > 90` 扫 9 行）、DELETE 的三值逻辑（NULL 不通过）、端到端
+    重开不丢 —— 特别是 rowid 计数器游标在重开后接续，不回退。
+- **M4 完成（2026-09-23）**：查询全量（`internal/exec` 的 aggregate.go / join.go、
+  operator.go 扩充、select.go 重写）。M4 期间定下的语义约定集中在 §7.5，
+  这里只记实现与验收：
+  - `internal/exec/expr.go`：binder 从单表升级为多作用域（scopeEntry 列表：
+    限定名 + 列偏移基址），未限定列跨表命中多个报 ambiguous；聚合绑定
+    上下文（aggContext）挂在 binder 上 —— FuncExpr 在绑定期被拦截登记成
+    aggSpec 并替换成伪行槽位引用，聚合写多处按表达式去重只算一份；
+  - `internal/exec/aggregate.go`：HashAgg 子树物化 + 哈希分组 + 增量聚合
+    （一遍扫描）；伪行 = 代表行 ++ 聚合值；GROUP BY 哈希键与 DISTINCT
+    去重键共用一套值身份规范化（NULL 同组、±0.0 归一、Kind 为界）；
+  - `internal/exec/join.go`：NLJoinNode —— 内表整表物化，ON 在循环内逐行
+    求值；多表 JOIN 装成左深树，连接行 = 各表行按 FROM 顺序首尾相接；
+  - `operator.go` 增 Sort（物化 + 稳定多键排序，NULL 视为最小）、Limit、
+    Distinct；FilterNode 加 label 让 HAVING 报错有正确上下文；
+  - `select.go` 重写：作用域构建 → star 展开 → WHERE 按表下推 → 扫描 +
+    连接树 → 聚合判定（GROUP BY/HAVING/输出或排序项含聚合）→ 绑定 →
+    Sort → Project → Distinct → Limit。主键下推从"单表一组界"升级为
+    "每个作用域条目一组界"，JOIN 下各表各自动作（下推可观测性保持）；
+  - `write.go` 适配新 binder / pushdownWhere 签名，写路径语义不变；
+  - 单测全绿（`go test ./...`），M4 验收线钉死：聚合五函数 + 空输入
+    语义（COUNT=0 / 其余 NULL）+ SUM(text) 执行期报错；GROUP BY 表达式
+    与列、NULL 自成一组、HAVING 过滤、未覆盖列报错；JOIN 的三值逻辑
+    （uid NULL 不匹配）、三表左深、限定 star、歧义列、ON 作用域限制、
+    别名自连接；排序 NULL 先/后 + 多键 + 别名/序号/表达式键；DISTINCT
+    的 NULL 合并 + 排序键约束；LIMIT/OFFSET 全分支；JOIN 下下推可观测
+    （orders 侧 `id >= 12` 扫 3 行）；组合拳（JOIN+GROUP BY+HAVING+
+    ORDER+LIMIT、DISTINCT+ORDER+LIMIT）。
+- **M5 完成（2026-09-23）**：收尾（`cmd/sqldb` REPL + README + 全量测试）。
+  - `cmd/sqldb/main.go`：REPL 主循环 —— 语句以 `;` 结尾、可跨多行（缓冲区
+    单引号计数判断完整性，字符串字面量里的 `;` 不截断）；元命令
+    `.tables` / `.schema [表名]` / `.help` / `.quit`；错误只报告不退出；
+    stdin 非终端时同样逐行执行，README 里的会话记录就是管道喂脚本原样捕获的；
+  - `cmd/sqldb/render.go`：展示层 —— 结果表格化（CJK 全角按 2 列计宽，
+    中列名/中文数据不错位；NULL 原样显示与空串可见区分）、schema 反渲染成
+    CREATE TABLE（隐藏 rowid 用注释标出）、`statementComplete` / `firstWord`；
+  - `sqldb.go` 补两个只读接口给 REPL 元命令用：`Tables()`（全部表名，排序）
+    和 `TableSchema(name)`（返回 catalog.Table 结构体而非 SQL 文本 ——
+    展示成什么样是 REPL 的自由，引擎只负责事实）；
+  - 展示结果按语句类型分流：SELECT 出表格，INSERT/UPDATE/DELETE 报
+    受影响行数（单复数区分），DDL 报 ok —— 用首单词判断而不是 Result 字段，
+    因为 Result 无法区分"DDL 成功"和"DML 影响 0 行"；
+  - M5 测试钉住的验收线：`go test ./...` 全绿（6 包，含 cmd/sqldb 新增的
+    表格渲染 / CJK 宽度 / 语句完整性 / REPL 管道端到端 / EOF 未闭合语句处理）、
+    `go vet` / `gofmt` 干净；手工会话记录进 README（真实捕获，未编辑）。
+    M5 期间修掉一个展示层真 bug：表格末行边框少写换行，导致下一行输出
+    （如 `(3 rows)`）粘在 `└...┘` 后面 —— 单测的精确字符串比对抓的。
 
 任何与本文档冲突的代码，以文档为准——先改文档再改代码。

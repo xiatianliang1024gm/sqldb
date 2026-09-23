@@ -4,9 +4,10 @@
 # WorkBuddy 工作区数据（记忆、日志等），不属于项目代码
 .workbuddy/
 
-# 临时输出文件
-out_*.txt
-git_out.txt
+# 临时输出文件（本机 PowerShell 工具无法直接捕获输出，go 命令一律重定向到
+# 文件再读，这些文件都是跑出来的产物，不入库）
+*_out.txt
+git_status.txt
 
 # Go 测试产生的数据库目录（catalog 单测等如果改用固定路径时会用到）
 testdata/
