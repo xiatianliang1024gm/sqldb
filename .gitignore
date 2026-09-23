@@ -1,0 +1,12 @@
+# 本机工具环境记录，不入库
+.goenv.txt
+
+# WorkBuddy 工作区数据（记忆、日志等），不属于项目代码
+.workbuddy/
+
+# 临时输出文件
+out_*.txt
+git_out.txt
+
+# Go 测试产生的数据库目录（catalog 单测等如果改用固定路径时会用到）
+testdata/
