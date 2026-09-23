@@ -4,7 +4,7 @@
 学习项目，目的是看清"SQL 层怎么长在 KV 存储上"，不是造可用数据库。
 
 设计文档：[`docs/DESIGN.md`](docs/DESIGN.md)（键空间布局、保序编码、catalog、
-Volcano 执行器、写路径、12 条关键取舍）。**里程碑 M0~M5 全部完成**，
+Volcano 执行器、写路径、16 条关键取舍）。**里程碑 M0~M6 全部完成**，
 `go test ./...` 全绿。
 
 ## 能做什么
@@ -18,9 +18,10 @@ Volcano 执行器、写路径、12 条关键取舍）。**里程碑 M0~M5 全部
 | 连接 | `INNER JOIN ... ON`（嵌套循环，左深树） |
 | 表达式 | 比较、四则、`AND/OR/NOT`、`IS [NOT] NULL`、`IN`、`BETWEEN`、`LIKE` |
 | 类型 | `INT / FLOAT / TEXT / BOOL` + `NULL`，三值逻辑，`NOT NULL`、主键约束 |
-| 优化 | 主键范围下推：`WHERE pk <op> 字面量` 折算成 KV 扫描区间（可观测） |
+| 索引 | `CREATE [UNIQUE] INDEX` / `DROP INDEX`：单列二级索引，写路径同批维护，查询自动选择（M6） |
+| 优化 | 主键范围下推 + 二级索引区间下推（条目扫 + 回表），均有扫描计数器可观测 |
 
-不做：事务、外键/CHECK、二级索引、LEFT JOIN、子查询、视图 —— 边界见 DESIGN §1。
+不做：事务、外键/CHECK、多列索引、覆盖索引、LEFT JOIN、子查询、视图 —— 边界见 DESIGN §1。
 
 ## 快速上手
 
@@ -138,4 +139,6 @@ docs/DESIGN.md        设计文档（键空间、保序编码、取舍表、里�
 - 无事务：单条语句靠 WriteBatch 原子，语句间无一致性快照；
 - INSERT 主键查重与提交之间无隔离（先 Get 再写的代价，DESIGN §8）；
 - 主键列不允许 UPDATE（改主键 = 删旧 + 插新，留给用户自己做）；
+- 二级索引只做等值/范围过滤：ORDER BY 不借索引免排序，UPDATE/DELETE 的
+  写扫描不走索引（只负责维护）；
 - Sort / HashAgg / DISTINCT 内存物化，无溢写。

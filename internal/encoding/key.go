@@ -85,12 +85,27 @@ func EncodeKey(v types.Value) ([]byte, error) {
 	return nil, fmt.Errorf("cannot encode key of kind %s", v.Kind)
 }
 
-// DecodeKey 是 EncodeKey 的逆操作。
+// EncodeIndexValue 编码二级索引的索引列值（DESIGN §7.5）。与 EncodeKey
+// 唯一的区别是允许 NULL：索引列可以为空，NULL 行用标签 0x00 占位
+// （唯一约束豁免 NULL，但条目本身要进索引）。
+func EncodeIndexValue(v types.Value) ([]byte, error) {
+	if v.IsNull() {
+		return []byte{tagNull}, nil
+	}
+	return EncodeKey(v)
+}
+
+// DecodeKey 是 EncodeKey 的逆操作（tagNull 分支服务于索引列值，M6）。
 func DecodeKey(b []byte) (types.Value, error) {
 	if len(b) == 0 {
 		return types.Value{}, fmt.Errorf("empty key")
 	}
 	switch b[0] {
+	case tagNull:
+		if len(b) != 1 {
+			return types.Value{}, fmt.Errorf("bad null key length %d", len(b))
+		}
+		return types.NullValue(), nil
 	case tagInt:
 		if len(b) != 9 {
 			return types.Value{}, fmt.Errorf("bad int key length %d", len(b))

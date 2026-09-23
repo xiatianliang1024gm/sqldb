@@ -26,16 +26,28 @@ type Plan struct {
 	Columns []string // 输出列名（含别名）
 	Root    Operator
 
-	scans []*ScanNode // 全部表扫描（JOIN 时含各内表），RowsScanned 可观测
+	scans      []*ScanNode      // 全部表扫描（JOIN 时含各内表），RowsScanned 可观测
+	indexScans []*IndexScanNode // 走了二级索引的扫描（M6），IndexEntriesScanned 可观测
 }
 
-// RowsScanned 返回所有 Scan 实际读过的 KV 行数之和。下推是否生效，
+// RowsScanned 返回所有表扫描实际读过的 KV 行数之和。下推是否生效，
 // 用这个数字说话：`WHERE id > 90` 在 100 行的表上应读到 9 行，而不是 100 行。
 // 单表查询就是 M2/M3 的语义；JOIN 是各表之和。
 func (p *Plan) RowsScanned() int64 {
 	var n int64
 	for _, s := range p.scans {
 		n += s.Scanned()
+	}
+	return n
+}
+
+// IndexEntriesScanned 返回全部索引扫描从存储引擎读走的条目数
+// （索引条目 + 回表点查，M6）。与 RowsScanned 对偶：走索引时它非零、
+// RowsScanned 为零；都不走时前者为零、后者是全表行数。
+func (p *Plan) IndexEntriesScanned() int64 {
+	var n int64
+	for _, s := range p.indexScans {
+		n += s.Scanned() + s.Lookups()
 	}
 	return n
 }
@@ -108,29 +120,46 @@ func Build(kv kvdb.Reader, cat *catalog.Catalog, stmt *parser.SelectStmt) (*Plan
 		names = append(names, itemName(item))
 	}
 
-	// 3. WHERE：拆合取项 → 按所属表各自尝试主键下推 → 残留项合成过滤器。
+	// 3. WHERE：拆合取项 → 按所属表各自尝试下推（主键优先，主键帮不上忙
+	//    的表再看二级索引，§7.3/§7.5）→ 残留项绑定成过滤器。
 	//    必须在聚合上下文挂上之前绑定（WHERE 永远作用于基表行）。
-	bounds, residual, err := pushdownWhere(b, stmt.Where)
+	bounds, residualExprs, idxPlans, err := pushdownWhere(b, cat, stmt.Where)
 	if err != nil {
 		return nil, err
 	}
 
-	// 4. 扫描 + 连接树。每张表一个 ScanNode（带上各自的下推区间）；
+	// 4. 扫描 + 连接树。每张表一个扫描节点：有可用索引下推走 IndexScan
+	//    （条目扫 + 回表），否则常规 Scan（带上主键下推区间）；
 	//    ON 的绑定作用域只含已出现的表 —— 引用后面才 JOIN 的表是错的。
 	plan := &Plan{}
 	var root Operator
 	for i, s := range b.scopes {
-		scan := &ScanNode{
-			kv:     kv,
-			table:  s.table,
-			prefix: encoding.RowKeyPrefix(s.table.ID),
-			lower:  bounds[i].lower,
-			upper:  bounds[i].upper,
-			kinds:  s.table.Kinds(),
+		var scanOp Operator
+		if ip := idxPlans[i]; ip != nil {
+			isc := &IndexScanNode{
+				kv:    kv,
+				table: s.table,
+				index: ip.def,
+				lower: ip.lower,
+				upper: ip.upper,
+				kinds: s.table.Kinds(),
+			}
+			plan.indexScans = append(plan.indexScans, isc)
+			scanOp = isc
+		} else {
+			scan := &ScanNode{
+				kv:     kv,
+				table:  s.table,
+				prefix: encoding.RowKeyPrefix(s.table.ID),
+				lower:  bounds[i].lower,
+				upper:  bounds[i].upper,
+				kinds:  s.table.Kinds(),
+			}
+			plan.scans = append(plan.scans, scan)
+			scanOp = scan
 		}
-		plan.scans = append(plan.scans, scan)
 		if i == 0 {
-			root = scan
+			root = scanOp
 			continue
 		}
 		onBinder := &binder{scopes: b.scopes[:i+1]}
@@ -138,10 +167,14 @@ func Build(kv kvdb.Reader, cat *catalog.Catalog, stmt *parser.SelectStmt) (*Plan
 		if err != nil {
 			return nil, fmt.Errorf("JOIN %s: %w", s.alias, err)
 		}
-		root = &NLJoinNode{outer: root, inner: scan, on: on, outerWidth: s.base}
+		root = &NLJoinNode{outer: root, inner: scanOp, on: on, outerWidth: s.base}
 	}
 	var pred boundExpr
-	for _, be := range residual {
+	for _, e := range residualExprs {
+		be, err := b.bind(e)
+		if err != nil {
+			return nil, err
+		}
 		if pred == nil {
 			pred = be
 			continue
@@ -328,33 +361,38 @@ func Build(kv kvdb.Reader, cat *catalog.Catalog, stmt *parser.SelectStmt) (*Plan
 	return plan, nil
 }
 
-// pushdownWhere 处理 WHERE：拆合取项 → 主键谓词按所属表折算成
-// [lower, upper)（每个作用域条目一组界）→ 其余绑定成残留谓词（逐行求值）。
-// SELECT 的计划构建和 UPDATE/DELETE 的写扫描共用这条路径 —— 写路径必须和
-// 查询走同一套下推逻辑（DESIGN §8），否则"改了哪几行"和"看见哪几行"会对不上。
+// pushdownWhere 处理 WHERE：拆合取项 → 两段下推 → 残留项原样返回
+// （由调用方绑定，SELECT 与 UPDATE/DELETE 的写扫描共用这条路径 ——
+// "改哪几行"和"看见哪几行"必须对得上，DESIGN §8）。
 //
-// JOIN 时各表各自动作：谓词里的列解析到哪张表，区间就折算到哪张表的
-// 扫描上。ON 不参与下推 —— 它在连接循环里逐行求值（M4 的取舍，见 §12）。
-func pushdownWhere(b *binder, where parser.Expr) (bounds []tableBounds, residual []boundExpr, err error) {
+// 两段（DESIGN §7.3）：
+//  1. 主键段：形如 pk <op> 字面量的合取项折算成所属表 Scan 的 [lower, upper)
+//     （每个作用域条目一组界）。主键是免费的有序入口，永远优先。
+//  2. 索引段（M6）：主键没帮上忙的表，再看它的合取项里有没有落在某个
+//     二级索引列上的同形谓词。有就选定该索引（等值优先），把命中该列的
+//     合取项全部折算进索引条目区间，该表的扫描换成 IndexScan。
+//
+// cat 为 nil 表示调用方不要索引下推（写路径的取舍，取舍表 #16）。
+// JOIN 时各表各自动作：谓词里的列解析到哪张表，区间就折算到哪张表上。
+// ON 不参与下推 —— 它在连接循环里逐行求值（M4 的取舍，见 §12）。
+func pushdownWhere(b *binder, cat *catalog.Catalog, where parser.Expr) (bounds []tableBounds, residual []parser.Expr, indexes map[int]*indexPushdown, err error) {
 	bounds = make([]tableBounds, len(b.scopes))
 	var conjuncts []parser.Expr
 	if where != nil {
 		splitConjuncts(where, &conjuncts)
 	}
+	used := make([]bool, len(conjuncts))
 
-	for _, c := range conjuncts {
+	// ── 段 1：主键下推 ──
+	for i, c := range conjuncts {
 		entry, op, lit, ok := matchPushdown(b, c)
 		if !ok {
-			be, err := b.bind(c)
-			if err != nil {
-				return nil, nil, err
-			}
-			residual = append(residual, be)
 			continue
 		}
+		used[i] = true
 		enc, err := encoding.EncodeKey(lit)
 		if err != nil {
-			return nil, nil, fmt.Errorf("push down primary key bound: %w", err)
+			return nil, nil, nil, fmt.Errorf("push down primary key bound: %w", err)
 		}
 		// 行键 = 表前缀 + 保序主键编码。四种比较各自折算成半开区间的
 		// 一端；区间推导依赖编码的前缀无歧义（DESIGN §4.2 三铁律），
@@ -377,7 +415,102 @@ func pushdownWhere(b *binder, where parser.Expr) (bounds []tableBounds, residual
 			bd.upper = minBytes(bd.upper, point)
 		}
 	}
-	return bounds, residual, nil
+
+	// ── 段 2：二级索引下推（M6）──
+	// 索引条目键 = i 前缀 + 索引名 + 0x00 + 保序索引列编码 + 保序主键编码。
+	// 注意区间几何与主键段有一处关键不同：条目在 enc(v) 之后还拖着主键
+	// 编码，所以"值等于 v"的排他上界是 enc(v) 的**后继**（prefixSuccessor）
+	// 而不是 enc(v)+0x00 —— 后者比任何一个同值条目都小，区间会是空的。
+	// 后继的正确性仍由前缀无歧义保证：[enc(v), succ(enc(v))) 恰好框住
+	// 全部以 enc(v) 开头的键（DESIGN §7.5）。
+	indexes = make(map[int]*indexPushdown)
+	if cat != nil {
+		for ent := range b.scopes {
+			if bounds[ent].lower != nil || bounds[ent].upper != nil {
+				continue // 主键已经下推，不叠加第二个入口
+			}
+			t := b.scopes[ent].table
+			defs := cat.IndexesOf(t)
+			if len(defs) == 0 {
+				continue
+			}
+			// 选索引：等值优先于范围；同一批合取项只选一个索引
+			//（多索引交集不在范围内，DESIGN §1）。
+			var chosen *catalog.IndexDef
+			for _, want := range []parser.BinaryOp{parser.OpEq, parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe} {
+				for i, c := range conjuncts {
+					if used[i] {
+						continue
+					}
+					if def, op, _, ok := matchIndexPushdown(b, c, defs); ok && op == want {
+						chosen = def
+						break
+					}
+				}
+				if chosen != nil {
+					break
+				}
+			}
+			if chosen == nil {
+				continue
+			}
+
+			ip := &indexPushdown{def: chosen}
+			for i, c := range conjuncts {
+				if used[i] {
+					continue
+				}
+				_, op, lit, ok := matchIndexPushdown(b, c, []*catalog.IndexDef{chosen})
+				if !ok {
+					continue
+				}
+				used[i] = true
+				enc, err := encoding.EncodeKey(lit)
+				if err != nil {
+					return nil, nil, nil, fmt.Errorf("push down index bound: %w", err)
+				}
+				prefix := encoding.IndexValuePrefix(t.ID, chosen.Name, enc)
+				point := prefixSuccessor(prefix)
+				switch op {
+				case parser.OpEq:
+					ip.lower = maxBytes(ip.lower, prefix)
+					ip.upper = minBytes(ip.upper, point)
+				case parser.OpGt:
+					ip.lower = maxBytes(ip.lower, point)
+				case parser.OpGe:
+					ip.lower = maxBytes(ip.lower, prefix)
+				case parser.OpLt:
+					ip.upper = minBytes(ip.upper, prefix)
+				case parser.OpLe:
+					ip.upper = minBytes(ip.upper, point)
+				}
+			}
+			// 区间关在本索引的区域内：缺下界用区域前缀，缺上界用其后继
+			// —— 与 ScanNode 的封口规则同理（共享键空间里区间不能越界，
+			// M2 教训）。
+			region := encoding.IndexRegionPrefix(t.ID, chosen.Name)
+			if ip.lower == nil {
+				ip.lower = region
+			}
+			if ip.upper == nil {
+				ip.upper = prefixSuccessor(region)
+			}
+			indexes[ent] = ip
+		}
+	}
+
+	for i, c := range conjuncts {
+		if !used[i] {
+			residual = append(residual, c)
+		}
+	}
+	return bounds, residual, indexes, nil
+}
+
+// indexPushdown 是一张表经二级索引下推后的扫描区间（半开，关在 i 区内）。
+type indexPushdown struct {
+	def          *catalog.IndexDef
+	lower, upper []byte
 }
 
 // splitConjuncts 把 WHERE 树按 AND 拍平。OR 不拆 —— 它不能独立折算成区间。
@@ -405,8 +538,29 @@ func flipOp(op parser.BinaryOp) parser.BinaryOp {
 	return op // = 和 != 对称
 }
 
-// matchPushdown 识别 "pk <op> 字面量"（两种书写顺序都认），返回谓词
-// 所属的作用域条目（JOIN 下各表各自动作）。
+// matchColumnLiteral 识别 "col <op> 字面量"（两种书写顺序都认，!= 除外
+// —— 它不是区间）。下推识别的公共前置：主键段与索引段共用。
+func matchColumnLiteral(e parser.Expr) (col *parser.ColumnRef, op parser.BinaryOp, lit *parser.Literal, ok bool) {
+	be, isBinary := e.(*parser.BinaryExpr)
+	if !isBinary || be.Op == parser.OpNe {
+		return nil, 0, nil, false
+	}
+	op = be.Op
+	switch l := be.L.(type) {
+	case *parser.ColumnRef:
+		if r, ok := be.R.(*parser.Literal); ok {
+			return l, op, r, true
+		}
+	case *parser.Literal:
+		if r, ok := be.R.(*parser.ColumnRef); ok {
+			return r, flipOp(op), l, true
+		}
+	}
+	return nil, 0, nil, false
+}
+
+// matchPushdown 识别 "pk <op> 字面量"，返回谓词所属的作用域条目
+// （JOIN 下各表各自动作）。
 //
 // 两条保守限制，都是为了正确性：
 //   - 字面量类型必须与主键列类型**完全一致**。INT 列配 FLOAT 字面量这种
@@ -418,25 +572,11 @@ func flipOp(op parser.BinaryOp) parser.BinaryOp {
 // 编码既不是 encode(v) 的前缀、也不以它为前缀，于是 k+00x 恰好是
 // "第一个严格大于 k 的可能行键"，点查 [k, k+00) 与 `<=` 的含端点上界都成立。
 func matchPushdown(b *binder, e parser.Expr) (entry int, op parser.BinaryOp, lit types.Value, ok bool) {
-	be, isBinary := e.(*parser.BinaryExpr)
-	if !isBinary || be.Op == parser.OpNe {
+	col, op, literal, ok := matchColumnLiteral(e)
+	if !ok {
 		return 0, 0, types.Value{}, false
 	}
-	op = be.Op
-	var col *parser.ColumnRef
-	var literal *parser.Literal
-	switch l := be.L.(type) {
-	case *parser.ColumnRef:
-		if r, ok := be.R.(*parser.Literal); ok {
-			col, literal = l, r
-		}
-	case *parser.Literal:
-		if r, ok := be.R.(*parser.ColumnRef); ok {
-			col, literal = r, l
-			op = flipOp(op)
-		}
-	}
-	if col == nil || literal.Value.IsNull() {
+	if literal.Value.IsNull() {
 		return 0, 0, types.Value{}, false // NULL 不参与比较，语义交给求值器（结果必为 NULL）
 	}
 	idx, err := b.resolve(col.Table, col.Name)
@@ -453,6 +593,34 @@ func matchPushdown(b *binder, e parser.Expr) (entry int, op parser.BinaryOp, lit
 		return 0, 0, types.Value{}, false // 不是主键列，或类型不一致（见上方限制）
 	}
 	return ent, op, literal.Value, true
+}
+
+// matchIndexPushdown 是主键下推的 M6 对偶：识别落在 defs 中某个索引列上的
+// "col <op> 字面量"。同样的保守限制（类型完全一致、!= 不认、NULL 不认），
+// 多一条几何前提：字面量类型与列类型一致时，EncodeKey 的输出就是条目里
+// 那段索引列编码的值域，区间折算才成立（DESIGN §7.3/§7.5）。
+func matchIndexPushdown(b *binder, e parser.Expr, defs []*catalog.IndexDef) (def *catalog.IndexDef, op parser.BinaryOp, lit types.Value, ok bool) {
+	col, op, literal, ok := matchColumnLiteral(e)
+	if !ok || literal.Value.IsNull() {
+		return nil, 0, types.Value{}, false
+	}
+	idx, err := b.resolve(col.Table, col.Name)
+	if err != nil {
+		return nil, 0, types.Value{}, false
+	}
+	ent := b.scopeForOffset(idx)
+	if ent < 0 {
+		return nil, 0, types.Value{}, false
+	}
+	t := b.scopes[ent].table
+	local := idx - b.scopes[ent].base
+	for _, d := range defs {
+		ci := t.ColumnIndex(d.Column)
+		if ci == local && literal.Value.Kind == t.Columns[ci].Kind {
+			return d, op, literal.Value, true
+		}
+	}
+	return nil, 0, types.Value{}, false
 }
 
 // containsAggExpr 报告表达式里有没有聚合调用。parser 只为聚合函数产

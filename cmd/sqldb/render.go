@@ -141,6 +141,15 @@ func renderCreateTable(t *catalog.Table) string {
 	return b.String()
 }
 
+// renderCreateIndex 把索引定义反渲染成 CREATE INDEX（.schema 命令，M6）。
+func renderCreateIndex(d *catalog.IndexDef) string {
+	unique := ""
+	if d.Unique {
+		unique = "UNIQUE "
+	}
+	return fmt.Sprintf("CREATE %sINDEX %s ON %s (%s);\n", unique, d.Name, d.Table, d.Column)
+}
+
 // firstWord 返回语句的首个单词（大写），REPL 用它决定结果的展示方式。
 // 跳过前导空白 —— execSQL 传进来的语句已去尾部分号，但不保证头部干净。
 func firstWord(sql string) string {

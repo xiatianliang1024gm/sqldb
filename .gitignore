@@ -8,6 +8,8 @@
 # 文件再读，这些文件都是跑出来的产物，不入库）
 *_out.txt
 git_status.txt
+git_commit.txt
+exitcode.txt
 
 # Go 测试产生的数据库目录（catalog 单测等如果改用固定路径时会用到）
 testdata/

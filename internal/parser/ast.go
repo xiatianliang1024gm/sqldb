@@ -35,6 +35,22 @@ type DropTableStmt struct {
 	Table    string
 }
 
+// CreateIndexStmt 是 CREATE [UNIQUE] INDEX。单列索引（DESIGN §7.5）；
+// 列是否存在、是不是主键，都是执行层（catalog）的检查。
+type CreateIndexStmt struct {
+	Unique      bool
+	IfNotExists bool
+	Name        string
+	Table       string
+	Column      string
+}
+
+// DropIndexStmt 是 DROP INDEX。
+type DropIndexStmt struct {
+	IfExists bool
+	Name     string
+}
+
 // InsertStmt 是 INSERT INTO。Columns 为 nil 表示按 schema 顺序给全列；
 // Rows 的每一行长度必须与 Columns（或全列数）一致，长度在解析期就校验。
 type InsertStmt struct {
@@ -105,6 +121,8 @@ type OrderItem struct {
 
 func (*CreateTableStmt) stmt() {}
 func (*DropTableStmt) stmt()   {}
+func (*CreateIndexStmt) stmt() {}
+func (*DropIndexStmt) stmt()   {}
 func (*InsertStmt) stmt()      {}
 func (*UpdateStmt) stmt()      {}
 func (*DeleteStmt) stmt()      {}

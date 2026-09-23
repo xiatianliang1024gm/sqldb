@@ -72,6 +72,16 @@ func (db *DB) TableSchema(name string) (*catalog.Table, error) {
 	return t, nil
 }
 
+// TableIndexes 返回一张表的全部二级索引定义（M6，REPL 的 .schema 用）。
+// 表不存在报错；没有索引返回空切片。
+func (db *DB) TableIndexes(name string) ([]*catalog.IndexDef, error) {
+	t, ok := db.cat.GetTable(name)
+	if !ok {
+		return nil, fmt.Errorf("no such table: %s", name)
+	}
+	return db.cat.IndexesOf(t), nil
+}
+
 // Exec 解析并执行一条 SQL 语句。一次一条 —— 多语句由调用方拆分
 // （解析器遇到多余 token 会报错，不会静默吞掉后半句）。
 func (db *DB) Exec(sql string) (*Result, error) {
@@ -84,6 +94,16 @@ func (db *DB) Exec(sql string) (*Result, error) {
 		return db.execCreateTable(s)
 	case *parser.DropTableStmt:
 		return db.execDropTable(s)
+	case *parser.CreateIndexStmt:
+		if err := exec.ExecCreateIndex(db.kv, db.cat, s); err != nil {
+			return nil, err
+		}
+		return &Result{}, nil
+	case *parser.DropIndexStmt:
+		if err := exec.ExecDropIndex(db.kv, db.cat, s); err != nil {
+			return nil, err
+		}
+		return &Result{}, nil
 	case *parser.SelectStmt:
 		return db.execSelect(s)
 	case *parser.InsertStmt:

@@ -126,6 +126,7 @@ var keywords = map[string]bool{
 	"INSERT": true, "INTO": true, "VALUES": true,
 	"UPDATE": true, "SET": true, "DELETE": true,
 	"CREATE": true, "TABLE": true, "DROP": true, "IF": true, "EXISTS": true,
+	"INDEX": true, "UNIQUE": true,
 	"NOT": true, "NULL": true, "PRIMARY": true, "KEY": true,
 	"JOIN": true, "INNER": true, "ON": true,
 	"AND": true, "OR": true, "IS": true, "IN": true, "BETWEEN": true, "LIKE": true,

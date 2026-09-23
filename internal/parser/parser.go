@@ -136,8 +136,15 @@ func (p *parser) parseIdent(what string) (string, error) {
 func (p *parser) parseStatement() (Stmt, error) {
 	switch {
 	case p.atKeyword("CREATE"):
+		if p.peek().IsKeyword("INDEX") ||
+			(p.peek().IsKeyword("UNIQUE") && p.peekN(2).IsKeyword("INDEX")) {
+			return p.parseCreateIndex()
+		}
 		return p.parseCreateTable()
 	case p.atKeyword("DROP"):
+		if p.peek().IsKeyword("INDEX") {
+			return p.parseDropIndex()
+		}
 		return p.parseDropTable()
 	case p.atKeyword("INSERT"):
 		return p.parseInsert()
@@ -272,6 +279,82 @@ func (p *parser) parseDropTable() (Stmt, error) {
 		return nil, err
 	}
 	stmt.Table = name
+	return stmt, nil
+}
+
+// parseCreateIndex: CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON t ( col )
+//
+// 与 CREATE TABLE 的分叉靠向后看一个 token（INDEX / TABLE）——递归下降
+// 的标配手法。INDEX / UNIQUE 从 M6 起进保留字表：与类型名不进保留字的
+// 约定（§6 第 2 条）不同，这两个词在任何子集语句里都没有"当标识符用"
+// 的既有位置，收编为关键字换取无歧义的语法 —— 代价是列/表不能再叫
+// index 或 unique，与真实 SQL 的保留字策略一致。
+func (p *parser) parseCreateIndex() (Stmt, error) {
+	p.next() // CREATE
+	stmt := &CreateIndexStmt{}
+	if p.atKeyword("UNIQUE") {
+		p.next()
+		stmt.Unique = true
+	}
+	if err := p.expectKeyword("INDEX"); err != nil {
+		return nil, err
+	}
+	if p.atKeyword("IF") {
+		p.next()
+		if err := p.expectKeyword("NOT"); err != nil {
+			return nil, err
+		}
+		if err := p.expectKeyword("EXISTS"); err != nil {
+			return nil, err
+		}
+		stmt.IfNotExists = true
+	}
+	name, err := p.parseIdent("index name")
+	if err != nil {
+		return nil, err
+	}
+	stmt.Name = name
+	if err := p.expectKeyword("ON"); err != nil {
+		return nil, err
+	}
+	table, err := p.parseIdent("table name")
+	if err != nil {
+		return nil, err
+	}
+	stmt.Table = table
+	if err := p.expect(LParen, "'(' before indexed column"); err != nil {
+		return nil, err
+	}
+	col, err := p.parseIdent("column name")
+	if err != nil {
+		return nil, err
+	}
+	stmt.Column = col
+	if err := p.expect(RParen, "')' after indexed column"); err != nil {
+		return nil, err
+	}
+	return stmt, nil
+}
+
+// parseDropIndex: DROP INDEX [IF EXISTS] name
+func (p *parser) parseDropIndex() (Stmt, error) {
+	p.next() // DROP
+	if err := p.expectKeyword("INDEX"); err != nil {
+		return nil, err
+	}
+	stmt := &DropIndexStmt{}
+	if p.atKeyword("IF") {
+		p.next()
+		if err := p.expectKeyword("EXISTS"); err != nil {
+			return nil, err
+		}
+		stmt.IfExists = true
+	}
+	name, err := p.parseIdent("index name")
+	if err != nil {
+		return nil, err
+	}
+	stmt.Name = name
 	return stmt, nil
 }
 

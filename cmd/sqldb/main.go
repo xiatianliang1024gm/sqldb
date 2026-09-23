@@ -184,4 +184,13 @@ func printSchema(db *sqldb.DB, name string, out io.Writer) {
 		return
 	}
 	fmt.Fprint(out, renderCreateTable(t))
+	// 索引跟着 schema 一起展示（M6）：引擎给定义，展示层负责反渲染。
+	idxs, err := db.TableIndexes(name)
+	if err != nil {
+		fmt.Fprintf(out, "error: %v\n", err)
+		return
+	}
+	for _, d := range idxs {
+		fmt.Fprint(out, renderCreateIndex(d))
+	}
 }

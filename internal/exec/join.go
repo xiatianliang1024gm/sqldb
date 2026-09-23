@@ -19,7 +19,7 @@ import (
 
 type NLJoinNode struct {
 	outer      Operator
-	inner      *ScanNode // 内表扫描；首轮 Next 时整表物化，之后不再碰迭代器
+	inner      Operator  // 内表扫描（ScanNode / IndexScanNode）；首轮 Next 时整表物化，之后不再碰迭代器
 	on         boundExpr // 绑定在"外表 ++ 内表"的合并行上（作用域只含已出现的表）
 	outerWidth int       // 外表行的列数 = 合并行的前缀长度
 

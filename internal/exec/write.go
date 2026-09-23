@@ -12,6 +12,7 @@ package exec
 // 单机嵌入式、单写者假设下不会发生，不为此加锁。
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 
@@ -70,6 +71,7 @@ func ExecInsert(kv kvdb.Store, cat *catalog.Catalog, stmt *parser.InsertStmt) (i
 	//    Write 之前返回 —— 整条语句一行不落（语句级原子）。
 	pkIdx := t.PrimaryKeyIndex()
 	batch := kvdb.NewWriteBatch()
+	scratch := newWriteScratch() // 同批多行的查重洞（含主键 + 唯一索引）
 	for i := range stmt.Rows {
 		row := make([]types.Value, len(t.Columns))
 		for ci := range row {
@@ -102,12 +104,32 @@ func ExecInsert(kv kvdb.Store, cat *catalog.Catalog, stmt *parser.InsertStmt) (i
 			return 0, fmt.Errorf("VALUES row %d: %w", i+1, err)
 		}
 		key := encoding.RowKey(t.ID, enc)
+		// 查重两道关：本语句先前编进 batch 的行（Get 看不见），以及已提交
+		// 的数据。第二关与提交之间无隔离（DESIGN §8"读检查非原子"）。
+		if scratch.rows[string(key)] {
+			return 0, fmt.Errorf("VALUES row %d: duplicate primary key %v in %s", i+1, row[pkIdx], t.Name)
+		}
 		if _, err := kv.Get(key); err == nil {
 			return 0, fmt.Errorf("VALUES row %d: duplicate primary key %v in %s", i+1, row[pkIdx], t.Name)
 		} else if !errors.Is(err, kvdb.ErrNotFound) {
 			return 0, fmt.Errorf("insert into %s: %w", t.Name, err)
 		}
+		scratch.rows[string(key)] = true
+		// 唯一索引查重（M6，DESIGN §8）：NULL 豁免在 checkUnique 里。
+		for _, d := range cat.IndexesOf(t) {
+			if !d.Unique {
+				continue
+			}
+			v := row[t.ColumnIndex(d.Column)]
+			if err := checkUnique(kv, t, d, v, enc, scratch); err != nil {
+				return 0, fmt.Errorf("VALUES row %d: %w", i+1, err)
+			}
+		}
 		if err := batch.Put(key, encoding.EncodeRow(row)); err != nil {
+			return 0, err
+		}
+		// 索引条目与行编进同一个 batch —— 同生同死（DESIGN §8 索引维护）。
+		if err := putIndexEntries(batch, cat, t, row); err != nil {
 			return 0, err
 		}
 	}
@@ -274,11 +296,20 @@ func scanTableRows(kv kvdb.Reader, t *catalog.Table, lower, upper []byte, residu
 
 // bindWhere 为 UPDATE / DELETE 绑定 WHERE。这两个语句的表名没有别名语法，
 // scope 就是表名本身。返回该表（作用域条目 0）的下推区间与残留谓词。
+// cat 传 nil：写路径不做索引下推，只维护索引（取舍表 #16）—— 扫描仍走
+// 主键快路，索引条目由 ExecUpdate/ExecDelete 负责跟着行改。
 func bindWhere(t *catalog.Table, tableName string, where parser.Expr) (lower, upper []byte, residual []boundExpr, err error) {
 	b := newBinder(t, tableName)
-	bounds, residual, err := pushdownWhere(b, where)
+	bounds, res, _, err := pushdownWhere(b, nil, where)
 	if err != nil {
 		return nil, nil, nil, err
+	}
+	for _, e := range res {
+		be, err := b.bind(e)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		residual = append(residual, be)
 	}
 	return bounds[0].lower, bounds[0].upper, residual, nil
 }
@@ -327,8 +358,18 @@ func ExecUpdate(kv kvdb.Store, cat *catalog.Catalog, stmt *parser.UpdateStmt) (i
 		return 0, err
 	}
 
+	// 只改到某索引列才动那张索引（DESIGN §8 索引维护）：先收集被 SET 的列。
+	setCols := make(map[int]bool, len(stmt.Set))
+	for _, s := range sets {
+		setCols[s.idx] = true
+	}
+	scratch := newWriteScratch()
 	batch := kvdb.NewWriteBatch()
 	for _, h := range hits {
+		pkEnc, err := encoding.EncodeKey(h.row[pkIdx]) // 主键不可改，新旧行共用
+		if err != nil {
+			return 0, err
+		}
 		newRow := append([]types.Value(nil), h.row...)
 		for _, s := range sets {
 			v, err := s.expr.eval(h.row) // SET 的求值环境是更新前的行
@@ -344,6 +385,37 @@ func ExecUpdate(kv kvdb.Store, cat *catalog.Catalog, stmt *parser.UpdateStmt) (i
 				return 0, fmt.Errorf("UPDATE %s: column %s is NOT NULL", t.Name, col.Name)
 			}
 			newRow[s.idx] = v
+		}
+		// 索引维护（M6）：删旧条目、唯一查重、写新条目，全部编进同一个
+		// batch —— 行与条目同生同死。唯一查重的冲突必须发生在 Write 之前，
+		// 任何一行冲突整条语句一行不落（与 INSERT 同一纪律）。
+		for _, d := range cat.IndexesOf(t) {
+			ci := t.ColumnIndex(d.Column)
+			if !setCols[ci] {
+				continue // 索引列没被 SET，条目原样有效
+			}
+			oldKey, err := indexEntryKey(t, d, h.row)
+			if err != nil {
+				return 0, err
+			}
+			newKey, err := indexEntryKey(t, d, newRow)
+			if err != nil {
+				return 0, err
+			}
+			if bytes.Equal(oldKey, newKey) {
+				continue // 值没变（或变化不改变编码），条目原样有效
+			}
+			if d.Unique {
+				if err := checkUnique(kv, t, d, newRow[ci], pkEnc, scratch); err != nil {
+					return 0, fmt.Errorf("UPDATE %s: %w", t.Name, err)
+				}
+			}
+			if err := batch.Delete(oldKey); err != nil {
+				return 0, err
+			}
+			if err := batch.Put(newKey, nil); err != nil {
+				return 0, err
+			}
 		}
 		if err := batch.Put(h.key, encoding.EncodeRow(newRow)); err != nil {
 			return 0, err
@@ -377,6 +449,10 @@ func ExecDelete(kv kvdb.Store, cat *catalog.Catalog, stmt *parser.DeleteStmt) (i
 	batch := kvdb.NewWriteBatch()
 	for _, h := range hits {
 		if err := batch.Delete(h.key); err != nil {
+			return 0, err
+		}
+		// 索引条目跟着行一起删，同一个 batch（DESIGN §8 索引维护）。
+		if err := deleteIndexEntries(batch, cat, t, h.row); err != nil {
 			return 0, err
 		}
 	}
